@@ -12,17 +12,24 @@ function Write-CheckLog([string]$Message) {
     Add-Content -LiteralPath $logPath -Value ('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) -Encoding UTF8
 }
 
-function Get-DesktopStarts {
-    # Match the installed desktop package, not its CLI workers or check process.
-    $desktop = @(Get-CimInstance Win32_Process -Filter "Name = 'ChatGPT.exe'" | Where-Object {
-        $_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$'
-    })
-    $ids = @($desktop | ForEach-Object { $_.ProcessId })
-    @($desktop | Where-Object { $_.ParentProcessId -notin $ids } | ForEach-Object {
-        try {
-            '{0}:{1}' -f $_.ProcessId, $_.CreationDate.ToUniversalTime().Ticks
-        } catch { }
-    })
+function Get-ConfigFingerprint {
+    $stream = $null
+    $hasher = $null
+    try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = [IO.File]::Open($configPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '')
+    } catch { $null } finally {
+        if ($stream) { $stream.Dispose() }
+        if ($hasher) { $hasher.Dispose() }
+    }
+}
+
+function Test-RetryableStatus([string]$Status) {
+    $Status -in @('blocked_provider','blocked_route','blocked_table_shape','blocked_file_busy',
+        'blocked_config_changed','blocked_check_error','blocked_worker_error','blocked_timeout',
+        'blocked_invalid_result')
 }
 
 function Invoke-StartupCheck {
@@ -41,15 +48,17 @@ function Invoke-StartupCheck {
             $proc.Kill()
             $proc.WaitForExit()
             Write-CheckLog 'status=blocked_timeout'
-            return
+            return 'blocked_timeout'
         }
         $status = ($stdout.Result | ConvertFrom-Json).status
-        if ($status -notin @('alias_present','repaired','blocked_provider','blocked_route','blocked_table_shape','blocked_file_busy','blocked_config_changed','blocked_check_error')) {
+        if ($status -notin @('alias_present','repaired','alias_synchronized','blocked_provider','blocked_route','blocked_table_shape','blocked_alias_conflict','blocked_file_busy','blocked_config_changed','blocked_check_error')) {
             $status = 'blocked_invalid_result'
         }
         Write-CheckLog ('status={0}; exit={1}' -f $status, $proc.ExitCode)
+        return $status
     } catch {
         Write-CheckLog 'status=blocked_worker_error'
+        return 'blocked_worker_error'
     } finally { $proc.Dispose() }
 }
 
@@ -60,22 +69,60 @@ try {
     try { $owned = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
     if (-not $owned) { return }
     if ($Once) { Invoke-StartupCheck; return }
-    Write-CheckLog 'monitor=started; mode=offline'
-    $seen = @{}
+    Write-CheckLog 'monitor=started; mode=offline; watch=config.toml; compatibility=bidirectional-v3'
+    $stableHash = Get-ConfigFingerprint
+    $retryHash = $null
+    $retryDue = $null
+    $retryDelay = 5
+    if ($stableHash) {
+        $status = Invoke-StartupCheck
+        if (Test-RetryableStatus $status) {
+            $retryHash = $stableHash
+            $retryDue = (Get-Date).AddSeconds($retryDelay)
+        }
+    }
+    $candidateHash = $null
+    $stableSamples = 0
     while ($true) {
-        $current = @(Get-DesktopStarts)
-        foreach ($key in @($seen.Keys)) {
-            if ($key -notin $current) { $seen.Remove($key) }
+        Start-Sleep -Seconds 2
+        $currentHash = Get-ConfigFingerprint
+        if (-not $currentHash) { $candidateHash = $null; $stableSamples = 0; continue }
+        if ($currentHash -eq $stableHash) {
+            $candidateHash = $null
+            $stableSamples = 0
+            if ($retryHash -eq $stableHash -and $retryDue -and (Get-Date) -ge $retryDue) {
+                $status = Invoke-StartupCheck
+                if (Test-RetryableStatus $status) {
+                    $retryDelay = [Math]::Min($retryDelay * 2, 30)
+                    $retryDue = (Get-Date).AddSeconds($retryDelay)
+                    Write-CheckLog ('retry_scheduled={0}s' -f $retryDelay)
+                } else {
+                    $retryHash = $null
+                    $retryDue = $null
+                    $retryDelay = 5
+                }
+            }
+            continue
         }
-        foreach ($key in $current) {
-            if (-not $seen.ContainsKey($key)) { $seen[$key] = @{ Due = (Get-Date).AddSeconds(15); Done = $false } }
+        if ($currentHash -eq $candidateHash) { $stableSamples++ }
+        else { $candidateHash = $currentHash; $stableSamples = 1 }
+        if ($stableSamples -ge 3) {
+            # Mark only the stable version observed before repair. If CC Switch
+            # writes again while the checker runs, the new hash stays detectable.
+            $stableHash = $candidateHash
+            $status = Invoke-StartupCheck
+            $candidateHash = $null
+            $stableSamples = 0
+            $retryDelay = 5
+            if (Test-RetryableStatus $status) {
+                $retryHash = $stableHash
+                $retryDue = (Get-Date).AddSeconds($retryDelay)
+                Write-CheckLog ('retry_scheduled={0}s' -f $retryDelay)
+            } else {
+                $retryHash = $null
+                $retryDue = $null
+            }
         }
-        $due = @($current | Where-Object { -not $seen[$_].Done -and (Get-Date) -ge $seen[$_].Due })
-        if ($due.Count -gt 0) {
-            Invoke-StartupCheck
-            foreach ($key in $due) { $seen[$key].Done = $true }
-        }
-        Start-Sleep -Seconds 3
     }
 } finally {
     if ($owned) { $mutex.ReleaseMutex() }

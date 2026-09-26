@@ -3,3 +3,9 @@ __pycache__/
 *.log
 *.bak
 .startup-repair-*
+
+*.db
+*.sqlite*
+config.toml
+auth.json
+.env

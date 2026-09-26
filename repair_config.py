@@ -12,38 +12,63 @@ from urllib.parse import urlsplit
 
 
 def proposal(raw):
-    text = raw.decode('utf-8-sig')
+    """Mirror the selected route under both historical thread provider IDs.
+
+    Never infer the route from an unselected table or an old backup.
+    """
+    bom = b'\xef\xbb\xbf' if raw.startswith(b'\xef\xbb\xbf') else b''
+    text = raw[len(bom):].decode('utf-8')
     config = tomllib.loads(text)
     providers = config.get('model_providers', {})
-    if 'custom' in providers:
-        return None, 'alias_present'
     selected = config.get('model_provider', '')
-    if not isinstance(selected, str) or not re.fullmatch(r'cc-switch[-\w]*', selected):
+    known = ('custom', 'cc-switch-official')
+    if selected not in known or not isinstance(providers, dict):
         return None, 'blocked_provider'
-    provider = providers.get(selected)
-    if not isinstance(provider, dict):
+    source = providers.get(selected)
+    if not isinstance(source, dict):
         return None, 'blocked_provider'
-    url = urlsplit(provider.get('base_url', ''))
-    if (url.scheme != 'http' or url.hostname != '127.0.0.1' or
-            url.port != 15721 or url.path.rstrip('/') != '/v1' or
-            url.username or url.password or url.query or url.fragment or
-            provider.get('wire_api') != 'responses'):
+    url = urlsplit(source.get('base_url', ''))
+    if (url.scheme not in ('http', 'https') or not url.hostname or
+            url.username or url.password or source.get('wire_api') != 'responses'):
         return None, 'blocked_route'
-    # Only accept a simple standalone table; semantic comparison below catches
-    # nested tables, multiline strings, and unexpected TOML constructs.
-    pattern = r'(?m)^\[model_providers\.' + re.escape(selected) + r'\][ \t]*(?:#[^\r\n]*)?\r?$'
-    matches = list(re.finditer(pattern, text))
-    if len(matches) != 1:
+    target = next(key for key in known if key != selected)
+    if providers.get(target) == source:
+        return None, 'alias_present'
+
+    def span(name):
+        key = re.escape(name)
+        pattern = r'(?m)^[ \t]*\[model_providers\.(?:' + key + r'|"' + key + r'"|\x27' + key + r'\x27)\][ \t]*(?:#[^\r\n]*)?\r?$'
+        matches = list(re.finditer(pattern, text))
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+        following = re.search(r'(?m)^[ \t]*\[', text[match.end():])
+        end = match.end() + following.start() if following else len(text)
+        return match.start(), match.end(), end
+
+    source_span = span(selected)
+    if source_span is None:
         return None, 'blocked_table_shape'
-    rest = text[matches[0].end():]
-    next_header = re.search(r'(?m)^\s*\[', rest)
-    body = rest[:next_header.start()] if next_header else rest
-    candidate = raw + ('\n[model_providers.custom]' + body + '\n').encode('utf-8')
+    body = text[source_span[1]:source_span[2]]
+    replacement = '[model_providers.' + target + ']' + body + '\n'
+    exists = target in providers
+    if exists:
+        target_span = span(target)
+        if target_span is None:
+            return None, 'blocked_table_shape'
+        candidate_text = text[:target_span[0]] + replacement + text[target_span[2]:]
+    else:
+        candidate_text = text + '\n' + replacement
     expected = copy.deepcopy(config)
-    expected['model_providers']['custom'] = copy.deepcopy(provider)
-    if tomllib.loads(candidate.decode('utf-8-sig')) != expected:
+    expected['model_providers'][target] = copy.deepcopy(source)
+    try:
+        parsed = tomllib.loads(candidate_text)
+    except tomllib.TOMLDecodeError:
         return None, 'blocked_table_shape'
-    return candidate, 'repaired'
+    if parsed != expected:
+        return None, 'blocked_table_shape'
+    return bom + candidate_text.encode('utf-8'), ('alias_synchronized' if exists else 'repaired')
+
 
 
 def repair(path):
@@ -98,4 +123,4 @@ if __name__ == '__main__':
         # Never log configuration contents, URLs, credentials or exception text.
         result = 'blocked_check_error'
     print(json.dumps({'status': result}))
-    sys.exit(0 if result in ('alias_present', 'repaired') else 2)
+    sys.exit(0 if result in ('alias_present', 'repaired', 'alias_synchronized') else 2)

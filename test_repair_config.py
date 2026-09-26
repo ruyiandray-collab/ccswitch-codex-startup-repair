@@ -1,56 +1,71 @@
+import copy
+import importlib.util
 import tempfile
-from pathlib import Path
+import tomllib
 import unittest
-from repair_config import proposal, repair
+from pathlib import Path
 
-BASE = b'''model_provider = "cc-switch-official"
-[model_providers.cc-switch-official]
-name = "OpenAI"
-requires_openai_auth = true
-wire_api = "responses"
-base_url = "http://127.0.0.1:15721/v1"
-[desktop]
-foo = true
-'''
+spec = importlib.util.spec_from_file_location('repair', Path(__file__).with_name('repair_config.py'))
+repair = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(repair)
 
-class RepairTests(unittest.TestCase):
-    def test_repair_and_idempotence(self):
-        candidate, status = proposal(BASE)
-        self.assertEqual(status, 'repaired')
-        self.assertTrue(candidate.startswith(BASE))
-        self.assertEqual(proposal(candidate), (None, 'alias_present'))
+def config(selected='custom', url='http://127.0.0.1:15721/v1', alias=None):
+    text = f'model_provider = "{selected}"\nmodel = "unchanged"\n[model_providers.{selected}]\nname = "Active"\nbase_url = "{url}"\nwire_api = "responses"\nrequires_openai_auth = true\n'
+    if alias is not None:
+        target = 'custom' if selected == 'cc-switch-official' else 'cc-switch-official'
+        text += f'\n[model_providers.{target}]\nname = "Old"\nbase_url = "{alias}"\nwire_api = "responses"\n'
+    return (text + '\n[other]\nkeep = "yes"\n').encode()
 
-    def test_existing_alias_preserved(self):
-        raw = BASE + b'\n[model_providers.custom]\nname = "Other"\n'
-        self.assertEqual(proposal(raw), (None, 'alias_present'))
+class CompatibilityTests(unittest.TestCase):
+    def check_mirror(self, raw):
+        before = tomllib.loads(raw.decode('utf-8-sig'))
+        candidate, status = repair.proposal(raw)
+        self.assertIn(status, ('repaired', 'alias_synchronized'))
+        result = tomllib.loads(candidate.decode('utf-8-sig'))
+        expected = copy.deepcopy(before)
+        target = 'custom' if before['model_provider'] == 'cc-switch-official' else 'cc-switch-official'
+        expected['model_providers'][target] = copy.deepcopy(before['model_providers'][before['model_provider']])
+        self.assertEqual(result, expected)
+        self.assertEqual(repair.proposal(candidate), (None, 'alias_present'))
 
-    def test_reject_remote_and_unknown_routes(self):
-        for old, new in [(b'127.0.0.1', b'example.com'), (b'15721', b'9999'),
-                         (b'cc-switch-official', b'other'), (b'/v1', b'/v1?token=secret')]:
-            self.assertIsNone(proposal(BASE.replace(old, new))[0])
+    def test_both_directions_local_and_direct(self):
+        for selected in ('custom', 'cc-switch-official'):
+            for url in ('http://127.0.0.1:15721/v1', 'https://example.test/v1'):
+                with self.subTest(selected=selected, url=url):
+                    self.check_mirror(config(selected, url))
 
-    def test_bom_crlf(self):
-        raw = b'\xef\xbb\xbf' + BASE.replace(b'\n', b'\r\n')
-        self.assertEqual(proposal(raw)[1], 'repaired')
+    def test_stale_alias_tracks_selected_not_old_provider(self):
+        for selected in ('custom', 'cc-switch-official'):
+            with self.subTest(selected=selected):
+                self.check_mirror(config(selected, alias='https://old.invalid/v1'))
 
-    def test_nested_provider_blocked(self):
-        raw = BASE.replace(b'[desktop]', b'[model_providers.cc-switch-official.http_headers]\nx="y"\n[desktop]')
-        self.assertEqual(proposal(raw), (None, 'blocked_table_shape'))
+    def test_missing_selected_never_uses_stale_alias(self):
+        raw = config().replace(b'model_provider = "custom"', b'model_provider = "cc-switch-official"')
+        self.assertEqual(repair.proposal(raw), (None, 'blocked_provider'))
 
-    def test_invalid_toml(self):
-        with self.assertRaises(ValueError):
-            proposal(BASE + b'broken = [')
+    def test_unrelated_selection_untouched(self):
+        self.assertEqual(repair.proposal(config('unrelated')), (None, 'blocked_provider'))
 
-    def test_disk_backup_and_noop(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'config.toml'
-            path.write_bytes(BASE)
-            self.assertEqual(repair(path), 'repaired')
-            backups = list(Path(directory).glob('*.bak'))
+    def test_nested_table_fails_closed(self):
+        raw = config().replace(b'[other]', b'[model_providers.custom.http_headers]\nx = "y"\n[other]')
+        self.assertEqual(repair.proposal(raw), (None, 'blocked_table_shape'))
+
+    def test_quoted_header_and_bom(self):
+        raw = b'\xef\xbb\xbf' + config().replace(b'[model_providers.custom]', b'[model_providers."custom"]').replace(b'\n', b'\r\n')
+        self.check_mirror(raw)
+        self.assertTrue(repair.proposal(raw)[0].startswith(b'\xef\xbb\xbf'))
+
+    def test_file_backup_and_idempotence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'config.toml'
+            raw = config()
+            path.write_bytes(raw)
+            self.assertEqual(repair.repair(path), 'repaired')
+            backups = list(Path(folder).glob('*.bak'))
             self.assertEqual(len(backups), 1)
-            self.assertEqual(backups[0].read_bytes(), BASE)
-            self.assertEqual(repair(path), 'alias_present')
-            self.assertEqual(len(list(Path(directory).glob('*.bak'))), 1)
+            self.assertEqual(backups[0].read_bytes(), raw)
+            self.assertEqual(repair.repair(path), 'alias_present')
+            self.assertEqual(len(list(Path(folder).glob('*.bak'))), 1)
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(verbosity=2)

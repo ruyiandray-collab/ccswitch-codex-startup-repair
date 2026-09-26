@@ -1,29 +1,28 @@
-# 审查与修复
+# Review and validation
 
-已部署到原目录 `C:\Users\ruyia\Documents\Codex\2026-09-24\wo\work`，计划任务名称及日志路径保持不变。
+## Root cause
 
-## 发现并处理
+Codex conversations retain provider IDs. Switching between configurations containing only `custom` or only `cc-switch-official` can leave older conversations referencing a missing provider. Earlier versions repaired only one direction and accepted only a local CC Switch source; retrying could not fix the other direction.
 
-- 高：原检查依靠提示词限制模型访问范围，却以真实 Codex 配置目录为工作目录运行可执行工具的模型。改为离线 Python TOML 检查，不启动模型、不读取会话、不上传配置。
-- 高：原日志记录截断的完整模型输出，可能夹带配置或敏感信息，且退出码 0 并不能证明别名修复正确。现在只记录固定状态码。
-- 中：原脚本识别 CLI 工作进程，无法可靠对应桌面启动，进程始终存在时还会漏掉重启。现在识别 WindowsApps 中 Codex 的 ChatGPT.exe 主进程，用 PID 和创建时间识别每次启动，排除子进程。
-- 中：原模型调用可能无限等待，阻塞整个监视器。现在检查最长 30 秒。
-- 中：缺少日志轮转、手动启动防重和任务异常恢复。增加 1 MiB 日志轮转、互斥锁、任务异常后每分钟重试，最多三次。
+## Changes
 
-## 配置处理
+- Mirror the selected, existing provider under the other historical name in both directions.
+- Synchronize stale historical aliases, retaining the selected route and all unrelated configuration.
+- Accept selected HTTP/HTTPS Responses routes, including proxy and direct connections.
+- Reject missing selected providers instead of guessing from another table.
+- Verify the complete parsed result equals the intended change before writing.
+- Back up original bytes before atomic replacement; check for concurrent modifications.
+- Monitor configuration content instead of desktop process starts; retain failed versions for retry.
+- Compute hashes with .NET directly to avoid PowerShell module autoload failures.
 
-已有 `custom` 时完全不改。缺失时仅接受名称以 `cc-switch` 开头、地址为 `http://127.0.0.1:15721/v1`、使用 responses API 的当前提供方。其他路由及复杂表结构保守跳过。添加后重新解析，必须证明唯一语义变化是新增与当前提供方完全相同的 custom 表。
+## Validation
 
-写入前创建独占命名备份，保留原始配置字节；临时文件刷新后原子替换。读取期间阻止原地写入，并在替换前再次比较原文件。Windows 释放句柄与替换之间仍存在很短的外部并发写入窗口；无法与不使用同一锁的 CC Switch 达成跨进程事务。不要把这描述为绝对并发安全。
+Seven test methods pass, with parameterized cases covering both IDs and local/direct routes. A separate isolated Windows monitor exercise passed official -> custom -> official transitions, stale alias synchronization, incomplete configuration retry, and recovery. Eighteen local profile replay cases also passed. These integration/replay checks were performed locally; the repository includes the portable unit tests but not private profile data or machine-specific integration fixtures.
 
-## 验证
+## Remaining limits
 
-7 项单元测试通过：新增别名及幂等性、保留现有别名、拒绝未知路由、BOM/CRLF、拒绝嵌套表、非法 TOML、真实文件备份与重复运行。PowerShell 语法检查通过。真实配置单次检查返回 alias_present / exit=0，前后 SHA-256 一致。
+The monitor reacts after a stable polling interval; it does not prevent every transient UI error. External writers can still race between the final comparison and replacement. Unsupported complex table layouts are rejected. The per-user mutex prevents duplicate monitors, not writes by CC Switch. Existing historical aliases intentionally follow the current route, rather than retaining their previous endpoint.
 
-## 运行依赖和回滚
+## Rollback
 
-使用本机 Codex 捆绑 Python 的稳定路径，依赖 tomllib。运行时被卸载或路径变化会记录 blocked_worker_error，不会改配置。监视规则针对当前 WindowsApps Codex 包布局，未来安装布局变化需要调整。
-
-原脚本备份在原目录，文件名带时间戳 `.bak`；原任务 XML 备份在本项目 work/task-original.xml。可停止任务、恢复脚本备份和任务 XML，再启动任务。此次实际配置无需修复，未改动。
-
-行为变更：不再调用 GPT-6 Luna；由离线检查完成原来的配置修复目的。
+Stop the scheduled task and wait for its process to exit. Restore the prior scripts and, if necessary, an appropriate configuration backup after checking that it does not discard later user changes. Restart the task. Do not blindly restore old configuration or application databases while their applications are writing them.
